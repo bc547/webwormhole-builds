@@ -1,0 +1,261 @@
+name: Build upstream WebWormhole release
+
+on:
+  schedule:
+    # Run once per day at 03:17 UTC.
+    - cron: "17 3 * * *"
+
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Delete and rebuild the current upstream release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: webwormhole-upstream-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_OWNER: saljam
+  UPSTREAM_REPOSITORY: webwormhole
+  UPSTREAM_BRANCH: master
+
+jobs:
+  check-build-release:
+    name: Check upstream and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out builder repository
+        uses: actions/checkout@v7
+
+      - name: Determine latest upstream commit
+        id: upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          api_url="https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPOSITORY}/commits/${UPSTREAM_BRANCH}"
+
+          upstream_json="$(
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 4 \
+              --retry-all-errors \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${api_url}"
+          )"
+
+          upstream_sha="$(jq -r '.sha' <<<"${upstream_json}")"
+          upstream_short_sha="${upstream_sha:0:12}"
+          upstream_date="$(jq -r '.commit.committer.date' <<<"${upstream_json}")"
+          upstream_subject="$(jq -r '.commit.message | split("\n")[0]' <<<"${upstream_json}")"
+
+          if [[ ! "${upstream_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid upstream commit SHA: ${upstream_sha}" >&2
+            exit 1
+          fi
+
+          release_tag="upstream-${upstream_short_sha}"
+
+          {
+            echo "sha=${upstream_sha}"
+            echo "short_sha=${upstream_short_sha}"
+            echo "date=${upstream_date}"
+            echo "subject=${upstream_subject}"
+            echo "tag=${release_tag}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Latest upstream commit: ${upstream_sha}"
+          echo "Target release tag: ${release_tag}"
+
+      - name: Check whether release already exists
+        id: existing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.upstream.outputs.tag }}
+          FORCE_BUILD: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${FORCE_BUILD}" == "true" ]]; then
+            echo "A forced rebuild was requested."
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+          elif gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists."
+            echo "No build is required."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "No existing release was found for ${RELEASE_TAG}."
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.existing.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build all targets inside Docker
+        if: steps.existing.outputs.skip != 'true'
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          rm -rf dist
+          mkdir -p dist
+
+          docker buildx build \
+            --file Dockerfile \
+            --target artifacts \
+            --build-arg "UPSTREAM_REF=${UPSTREAM_SHA}" \
+            --build-arg "UPSTREAM_REPOSITORY=https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPOSITORY}.git" \
+            --cache-from "type=gha" \
+            --cache-to "type=gha,mode=max" \
+            --output "type=local,dest=dist" \
+            .
+
+      - name: Verify generated artifacts
+        if: steps.existing.outputs.skip != 'true'
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          expected_files=(
+            "dist/ww-windows-amd64.exe"
+            "dist/ww-linux-amd64"
+            "dist/ww-linux-arm64-rpi"
+            "dist/ww-linux-riscv64"
+            "dist/SHA256SUMS"
+            "dist/SOURCE_COMMIT"
+            "dist/LICENSE-webwormhole"
+          )
+
+          for artifact in "${expected_files[@]}"; do
+            if [[ ! -f "${artifact}" ]]; then
+              echo "Missing artifact: ${artifact}" >&2
+              exit 1
+            fi
+          done
+
+          actual_sha="$(tr -d '[:space:]' < dist/SOURCE_COMMIT)"
+
+          if [[ "${actual_sha}" != "${EXPECTED_SHA}" ]]; then
+            echo "Source commit verification failed." >&2
+            echo "Expected: ${EXPECTED_SHA}" >&2
+            echo "Built:    ${actual_sha}" >&2
+            exit 1
+          fi
+
+          (
+            cd dist
+            sha256sum --check SHA256SUMS
+          )
+
+          echo
+          echo "Generated executable formats:"
+          file dist/ww-*
+
+      - name: Create release notes
+        if: steps.existing.outputs.skip != 'true'
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          UPSTREAM_DATE: ${{ steps.upstream.outputs.date }}
+          UPSTREAM_SUBJECT: ${{ steps.upstream.outputs.subject }}
+        run: |
+          set -euo pipefail
+
+          cat > release-notes.md <<EOF
+          This is an automated, unofficial build of WebWormhole.
+
+          ## Upstream source
+
+          Repository:
+          https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPOSITORY}
+
+          Commit:
+          https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPOSITORY}/commit/${UPSTREAM_SHA}
+
+          Commit SHA: \`${UPSTREAM_SHA}\`
+
+          Commit date: \`${UPSTREAM_DATE}\`
+
+          Commit subject: ${UPSTREAM_SUBJECT}
+
+          ## Included executables
+
+          - \`ww-windows-amd64.exe\`: Windows x86-64
+          - \`ww-linux-amd64\`: Linux x86-64
+          - \`ww-linux-arm64-rpi\`: Linux ARM64 for Raspberry Pi 3, 4, and 5 running a 64-bit operating system
+          - \`ww-linux-riscv64\`: Linux RISC-V 64-bit
+
+          All executables were cross-compiled inside Docker with
+          \`CGO_ENABLED=0\`.
+
+          ## Important notice
+
+          This is an unofficial downstream build. It is not produced,
+          reviewed, endorsed, signed, or supported by the upstream
+          WebWormhole maintainers.
+
+          The upstream project warns that it uses experimental cryptographic
+          libraries and has not undergone a security or cryptography review.
+
+          Verify downloaded executables using the included
+          \`SHA256SUMS\` file.
+          EOF
+
+      - name: Remove existing release for forced rebuild
+        if: >
+          steps.existing.outputs.skip != 'true' &&
+          inputs.force == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release delete "${RELEASE_TAG}" \
+              --cleanup-tag \
+              --yes
+          fi
+
+      - name: Publish GitHub release
+        if: steps.existing.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+
+          gh release create "${RELEASE_TAG}" \
+            dist/ww-windows-amd64.exe \
+            dist/ww-linux-amd64 \
+            dist/ww-linux-arm64-rpi \
+            dist/ww-linux-riscv64 \
+            dist/SHA256SUMS \
+            dist/SOURCE_COMMIT \
+            dist/LICENSE-webwormhole \
+            --title "WebWormhole upstream ${UPSTREAM_SHORT_SHA}" \
+            --notes-file release-notes.md \
+            --latest
